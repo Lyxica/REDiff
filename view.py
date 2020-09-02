@@ -3,6 +3,12 @@ import sys
 import time
 import re
 import selectors
+import fcntl
+import selectors
+import termios
+import socket
+import threading
+import errno
 
 
 def atoi(text):
@@ -29,6 +35,30 @@ class Viewer:
 	f2_data = None
 	opt_txt = ""
 	only_changed = False
+
+	_sel = None
+	isSynced = False
+	meshipc = None
+
+	def __init__(self):
+		# Setup terminal
+		fd = sys.stdin.fileno()
+
+		oldterm = termios.tcgetattr(fd)
+		newattr = oldterm[:]
+		newattr[3] = newattr[3] & ~termios.ICANON & ~termios.ECHO
+		termios.tcsetattr(fd, termios.TCSANOW, newattr)
+
+		oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
+		fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+
+		# Setup socket
+		server_address = ('localhost', 10000)
+		server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+		server.setblocking(False)
+		server.bind(server_address)
+
+		self.server = server
 
 	def load(self, f1, f2, opt_txt=""):
 		self.f1 = f1
@@ -61,9 +91,8 @@ class Viewer:
 
 	def draw(self): # print the text out
 		rows, columns = self.getsize()
-		out = chr(27) + "[2J"
-		time.sleep(0.05)
-		out += self.opt_txt + "\n"
+		print(chr(27) + "[2J")
+		out = self.opt_txt + "\n"
 
 		file_text = self.f1 + " -> " + self.f2
 		surrounding_space = columns - len(file_text)
@@ -109,7 +138,7 @@ class Viewer:
 
 		return out
 
-	def scrolldown(self, dist=3):
+	def scrolldown(self, dist=10):
 		rows, _ = self.getsize()
 		max = len(self.first_buffer) - rows  # lowest the buffer cursor can go, after accounting for displayed rows
 
@@ -123,7 +152,7 @@ class Viewer:
 
 		self.draw()
 
-	def scrollup(self, dist=3):
+	def scrollup(self, dist=10):
 		if self.currentLine == 0:
 			return
 
@@ -137,6 +166,56 @@ class Viewer:
 		rows, columns = os.popen('stty size', 'r').read().split()
 		return (int(rows) - 5, int(columns))
 
+	def processKeyboardKey(self, stdin, mask):
+		global current_file, printer, file_count
+		c = stdin.read(8)
+		if c:
+			if c == "s":  # Sync to other instances
+				self.isSynced = not self.isSynced
+				if self.isSynced:
+					self.meshipc = MeshIPC()
+					self._sel.register()
+				else:
+					self._sel.unregister()
+
+			if c == "\x1b[B":  # Up arrow
+				printer.scrolldown()
+			if c == "\x1b[A":  # Up arrow
+				printer.scrollup()
+			if c == "\x1b[6~":  # Pg Down
+				rows, _ = printer.getsize()
+				printer.scrolldown(rows)
+			if c == "\x1b[5~":  # Pg Up
+				rows, _ = printer.getsize()
+				printer.scrollup(rows)
+			if c == ".":
+				printer.only_changed = not printer.only_changed
+				printer.render()
+				printer.draw()
+			if c == "+":
+				if current_file + 2 >= file_count:
+					return
+				current_file += 1
+				printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
+			if c == "-":
+				if current_file == 0:
+					return
+				current_file -= 1
+				printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
+			#print(repr(c))
+			#print(str(c))
+
+	def process(self):
+		mysel = selectors.DefaultSelector()
+		mysel.register(sys.stdin, selectors.EVENT_READ, self.processKeyboardKey)
+		self.sel_ = mysel
+
+		while True:
+			# print('waiting for I/O')
+			for key, mask in mysel.select():
+				callback = key.data
+				callback(key.fileobj, mask)
+
 			
 	
 def reshape(lst, n):
@@ -146,63 +225,112 @@ def reshape(lst, n):
 def red(text):
 	return '\u001b[38;5;1m' + text + '\u001b[0m'
 
-def processKeyboardKey(stdin, mask):
-	global current_file, printer, file_count
-	c = stdin.read(8)
-	if c:
-		if c == "\x1b[B":  # Up arrow
-			printer.scrolldown()
-		if c == "\x1b[A":  # Up arrow
-			printer.scrollup()
-		if c == "\x1b[6~":  # Pg Down
-			rows, _ = printer.getsize()
-			printer.scrolldown(rows)
-		if c == "\x1b[5~":  # Pg Up
-			rows, _ = printer.getsize()
-			printer.scrollup(rows)
-		if c == ".":
-			printer.only_changed = not printer.only_changed
-			printer.render()
-			printer.draw()
-		if c == "+":
-			if current_file + 2 >= file_count:
-				return
-			current_file += 1
-			printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
-		if c == "-":
-			if current_file == 0:
-				return
-			current_file -= 1
-			printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
-		#print(repr(c))
-		#print(str(c))
-
-
-files = os.listdir(sys.argv[1])
-patterened_files = [x for x in files if x.startswith(sys.argv[2])]
-patterened_files.sort(key=natural_keys)
-current_file = 0
-file_count = len(patterened_files)
-
-opcodetext = [0x0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x12, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x5, 0x13, 0x12, 0x4, 0x16, 0x13, 0x12, 0x4, 0x3, 0x16, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x7, 0x3, 0x15, 0x14, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x7, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x1, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x2, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x14, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x15, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x11, 0x5, 0x11]
-processed_opcodes = ["Opcode: " + hex(x) for x in opcodetext]
-
-printer = Viewer()
-printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
 
 
 
+# files = os.listdir(sys.argv[1])
+# patterened_files = [x for x in files if x.startswith(sys.argv[2])]
+# patterened_files.sort(key=natural_keys)
+# current_file = 0
+# file_count = len(patterened_files)
+#
+# opcodetext = [0x0, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x15, 0x12, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x3, 0x5, 0x13, 0x12, 0x4, 0x16, 0x13, 0x12, 0x4, 0x3, 0x16, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x7, 0x3, 0x15, 0x14, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x7, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x1, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x2, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x14, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x13, 0x12, 0x4, 0x13, 0x12, 0x4, 0x3, 0x13, 0x12, 0x4, 0x3, 0x15, 0x3, 0x5, 0x3, 0xb, 0xb, 0x3, 0x15, 0x3, 0x11, 0x5, 0x11]
+# processed_opcodes = ["Opcode: " + hex(x) for x in opcodetext]
+#
+# printer = Viewer()
+# printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
+#
+# printer.process()
+
+CLIENT_ONLY = 0
+SERVER_ONLY = 1
 
 
-##############################################################
-import sys
-import fcntl
-import os
-import selectors
-import termios
-# set sys.stdin non-blocking
+class MeshIPC:
+	i_am_server = False
+	clients = []
+	socket = None
+	_sel = None
+
+	def __init__(self, sel):
+		self._sel = sel
+		self.connect()
+
+	def __del__(self):
+		if self._sel and self.socket:
+			self._sel.unregister(self.socket)
+
+		if self.socket:
+			self.socket.close()
+
+	def connect(self):
+		if self.socket:
+			self._sel.unregister(self.socket)
+		created_server = self.server()
+		self.i_am_server = created_server
+
+		if not created_server:
+			self.client()
+
+	def server(self):
+		server_address = ('localhost', 10000)
+		server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		server.setblocking(True)
+		try:
+			server.bind(server_address)
+			server.listen(1)
+		except socket.error as e:
+			return False
 
 
+
+		self.socket = server
+		thread = threading.Thread(None, self.accept, None, (server,))
+		thread.setDaemon(True)
+		thread.start()
+		print ("Im a server")
+
+		return True
+
+	def client(self):
+		server_address = ('localhost', 10000)
+		client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		client.connect(server_address)
+		client.setblocking(False)
+		self.socket = client
+		self._sel.register(client, selectors.EVENT_READ, lambda _, __, ipc=self: print(self.get()))
+
+	def send(self, data):
+		for con in self.clients:
+			try:
+				con.sendall(data.encode('utf-8'))
+			except IOError as e:
+				if e.errno == errno.EPIPE:
+					# client disconnected.
+					self.clients.remove(con)
+				else:
+					print(e)
+					break
+
+	def accept(self, server):  # Runs on another thread
+		while True:
+			connection, client_address = server.accept()
+			connection.setblocking(False)
+			self.clients.append(connection)
+
+	def get(self):
+		try:
+			data = self.socket.recv(4096)
+			if data == b'':
+				self.connect()
+				return ""
+			return data
+		except OSError as e:
+			if OSError.errno == errno.EAGAIN:
+				self.connect()
+				return ""
+
+# # Setup terminal
 fd = sys.stdin.fileno()
 
 oldterm = termios.tcgetattr(fd)
@@ -212,11 +340,21 @@ termios.tcsetattr(fd, termios.TCSANOW, newattr)
 
 oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
 fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+sel = selectors.DefaultSelector()
+tester = MeshIPC(sel)
 
-mysel = selectors.DefaultSelector()
-mysel.register(sys.stdin, selectors.EVENT_READ, processKeyboardKey)
+
+def keyboard(x, _):
+	data = x.read(8)
+	if tester.i_am_server:
+		tester.send(data)
+	print(data)
+
+
+sel.register(sys.stdin, selectors.EVENT_READ, keyboard)
+
 while True:
-    #print('waiting for I/O')
-    for key, mask in mysel.select():
-        callback = key.data
-        callback(key.fileobj, mask)
+	for key, mask in sel.select():
+		callback = key.data
+		callback(key.fileobj, mask)
+
