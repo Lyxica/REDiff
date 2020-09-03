@@ -57,6 +57,7 @@ class MeshIPC:
 		self.i_am_server = False
 
 	def connect(self):
+		self.stop()
 		created_server = self.server()
 
 		if not created_server:
@@ -123,11 +124,16 @@ class MeshIPC:
 		try:
 			data = self.socket.recv(4096)
 			if data == b'':
+				# If we get a 0-byte message then the server has (↔?) quit
+				# Let's try to become the server
 				self.connect()
 				return ""
 			return data
 		except OSError as e:
 			if OSError.errno == errno.EAGAIN:
+				# Sometimes its a 0-byte message, and sometimes its an errno.EAGAIN message that indicates
+				# the server has quit. (Similarly, ↔ ?)
+				# Let's try to become the server
 				self.connect()
 				return ""
 
