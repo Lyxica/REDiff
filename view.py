@@ -34,6 +34,7 @@ class MeshIPC:
 	_sel = None
 	callback = None
 	now_server_event = None
+	registered = False
 
 	def __init__(self, sel):
 		self._sel = sel
@@ -43,8 +44,9 @@ class MeshIPC:
 		self.stop()
 
 	def stop(self):
-		if not self.i_am_server:
+		if self.registered:
 			self._sel.unregister(self.socket)
+			self.registered = False
 
 		if self.socket:
 			for con in self.clients:
@@ -55,8 +57,6 @@ class MeshIPC:
 		self.i_am_server = False
 
 	def connect(self):
-		if self.socket:
-			self._sel.unregister(self.socket)
 		created_server = self.server()
 
 		if not created_server:
@@ -90,6 +90,7 @@ class MeshIPC:
 		client.setblocking(False)
 		self.socket = client
 		self._sel.register(client, selectors.EVENT_READ, self.callback_dispatch)
+		self.registered = True
 
 	def callback_dispatch(self, _, __):
 		data = self.get()
