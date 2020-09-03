@@ -22,23 +22,31 @@ def natural_keys(text):
     '''
     return [ atoi(c) for c in re.split(r'(\d+)', text) ]
 
+def log(txt):
+	f = open("log.txt", "a")
+	f.write(txt + "\n")
+	f.close()
 
 class MeshIPC:
 	i_am_server = False
 	clients = []
 	socket = None
 	_sel = None
+	callback = None
 
 	def __init__(self, sel):
 		self._sel = sel
 		self.connect()
 
-	def __del__(self):
-		if self._sel and self.socket:
+	def stop(self):
+		if not self.i_am_server:
 			self._sel.unregister(self.socket)
 
 		if self.socket:
+			for con in self.clients:
+				con.close()
 			self.socket.close()
+			self.socket = None
 
 	def connect(self):
 		if self.socket:
@@ -52,20 +60,18 @@ class MeshIPC:
 	def server(self):
 		server_address = ('localhost', 10000)
 		server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		server.setblocking(True)
+		server.setblocking(False)
 		try:
 			server.bind(server_address)
 			server.listen(1)
 		except socket.error as e:
 			return False
 
-
-
 		self.socket = server
 		thread = threading.Thread(None, self.accept, None, (server,))
 		thread.setDaemon(True)
 		thread.start()
-		print ("Im a server")
+		print("Im a server")
 
 		return True
 
@@ -75,7 +81,12 @@ class MeshIPC:
 		client.connect(server_address)
 		client.setblocking(False)
 		self.socket = client
-		self._sel.register(client, selectors.EVENT_READ, lambda _, __, ipc=self: print(self.get()))
+		self._sel.register(client, selectors.EVENT_READ, self.callback_dispatch)
+
+	def callback_dispatch(self, _, __):
+		data = self.get()
+		if self.callback:
+			self.callback(data)
 
 	def send(self, data):
 		for con in self.clients:
@@ -90,8 +101,12 @@ class MeshIPC:
 					break
 
 	def accept(self, server):  # Runs on another thread
-		while True:
-			connection, client_address = server.accept()
+		while self.socket is not None:
+			try:
+				connection, client_address = server.accept()
+			except BlockingIOError:
+				time.sleep(0.5)
+				continue
 			connection.setblocking(False)
 			self.clients.append(connection)
 
@@ -147,10 +162,10 @@ class Viewer:
 		self.f1_data = data1.read()
 		self.f2_data = data2.read()
 
-		printer.render()
-		printer.draw()
+		printer.prepare_buffer()
+		printer.draw_buffer()
 
-	def render(self): # actually load the buffer
+	def prepare_buffer(self): # actually load the buffer
 		size = 16
 		self.second_buffer.clear()
 		prevparts = reshape(self.f1_data, size)
@@ -166,10 +181,15 @@ class Viewer:
 			self.second_buffer.append(self._show(adjusted_prefixes[i], prevparts[i], nextparts[i]))
 		self.first_buffer = self.second_buffer.copy()
 
-	def draw(self): # print the text out
+	def draw_buffer(self): # print the text out
 		rows, columns = self.getsize()
 		print(chr(27) + "[2J")
 		out = self.opt_txt + "\n"
+		if self.meshIPC:
+			if self.meshIPC.i_am_server:
+				out += bg_green("SERVER") + "\n"
+			else:
+				out += bg_green("CLIENT") + "\n"
 
 		file_text = self.f1 + " -> " + self.f2
 		surrounding_space = columns - len(file_text)
@@ -227,7 +247,7 @@ class Viewer:
 		else:
 			self.currentLine = max
 
-		self.draw()
+		self.draw_buffer()
 
 	def scrollup(self, dist=10):
 		if self.currentLine == 0:
@@ -237,44 +257,89 @@ class Viewer:
 			self.currentLine -= dist
 		else:
 			self.currentLine = 0
-		self.draw()
+		self.draw_buffer()
 
 	def getsize(self):
 		rows, columns = os.popen('stty size', 'r').read().split()
 		return (int(rows) - 5, int(columns))
+
+	def event_handler(self, key):
+		global current_file, printer, file_count
+
+		if key == b"\x1b[B":  # Up arrow
+			printer.scrolldown()
+		if key == b"\x1b[A":  # Up arrow
+			printer.scrollup()
+		if key == b"\x1b[6~":  # Pg Down
+			rows, _ = printer.getsize()
+			printer.scrolldown(rows)
+		if key == b"\x1b[5~":  # Pg Up
+			rows, _ = printer.getsize()
+			printer.scrollup(rows)
+		if key == b".":
+			printer.only_changed = not printer.only_changed
+			printer.prepare_buffer()
+			printer.draw_buffer()
+		if key == b"+":
+			if current_file + 2 >= file_count:
+				return
+			current_file += 1
+			printer.load(sys.argv[1] + "//" + patterened_files[current_file],
+						 sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
+		if key == b"-":
+			if current_file == 0:
+				return
+			current_file -= 1
+			printer.load(sys.argv[1] + "//" + patterened_files[current_file],
+						 sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
 
 	def processKeyboardKey(self, stdin, mask):
 		global current_file, printer, file_count
 		c = stdin.read(8)
 		if c:
 			if c == "s":  # Sync to other instances
-				if self.meshIPC:
-					print("Disconnecting")
-					del self.meshIPC
+				if self.meshIPC is not None:
+					self.meshIPC.stop()
+					self.meshIPC = None
 				else:
-					print("Connecting")
 					self.meshIPC = MeshIPC(self.sel)
+					self.meshIPC.callback = self.event_handler
+				self.draw_buffer()
 
 			if c == "\x1b[B":  # Up arrow
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				printer.scrolldown()
 			if c == "\x1b[A":  # Up arrow
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				printer.scrollup()
 			if c == "\x1b[6~":  # Pg Down
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				rows, _ = printer.getsize()
 				printer.scrolldown(rows)
 			if c == "\x1b[5~":  # Pg Up
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				rows, _ = printer.getsize()
 				printer.scrollup(rows)
 			if c == ".":
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				printer.only_changed = not printer.only_changed
-				printer.render()
-				printer.draw()
+				printer.prepare_buffer()
+				printer.draw_buffer()
 			if c == "+":
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				if current_file + 2 >= file_count:
 					return
 				current_file += 1
 				printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
 			if c == "-":
+				if self.meshIPC and self.meshIPC.i_am_server:
+					self.meshIPC.send(c)
 				if current_file == 0:
 					return
 				current_file -= 1
@@ -292,7 +357,6 @@ class Viewer:
 				callback(key.fileobj, mask)
 
 
-
 def reshape(lst, n):
 	return [lst[i*n:(i+1)*n] for i in range(len(lst)//n)]
 
@@ -300,8 +364,8 @@ def reshape(lst, n):
 def red(text):
 	return '\u001b[38;5;1m' + text + '\u001b[0m'
 
-
-
+def bg_green(text):
+	return '\u001b[42;1m' + text + '\u001b[0m'
 
 files = os.listdir(sys.argv[1])
 patterened_files = [x for x in files if x.startswith(sys.argv[2])]
@@ -316,7 +380,3 @@ printer = Viewer()
 printer.load(sys.argv[1] + "//" + patterened_files[current_file], sys.argv[1] + "//" + patterened_files[current_file + 1], processed_opcodes[current_file])
 
 printer.process()
-
-CLIENT_ONLY = 0
-SERVER_ONLY = 1
-
