@@ -154,6 +154,9 @@ class Viewer:
 	sel = None
 	meshIPC = None
 
+	oldflags = None
+	oldterm = None
+
 	def __init__(self):
 		self.sel = selectors.DefaultSelector()
 		# Setup terminal
@@ -166,6 +169,14 @@ class Viewer:
 
 		oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
 		fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+
+		self.oldterm = oldterm
+		self.oldflags = oldflags
+
+	def __del__(self):
+		fd = sys.stdin.fileno()
+		termios.tcsetattr(fd, termios.TCSANOW, self.oldterm)
+		fcntl.fcntl(fd, fcntl.F_SETFL, self.oldflags)
 
 	def load(self, f1, f2, opt_txt=""):
 		self.f1 = f1
