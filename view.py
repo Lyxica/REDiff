@@ -39,6 +39,9 @@ class MeshIPC:
 		self._sel = sel
 		self.connect()
 
+	def __del__(self):
+		self.stop()
+
 	def stop(self):
 		if not self.i_am_server:
 			self._sel.unregister(self.socket)
