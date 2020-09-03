@@ -33,6 +33,7 @@ class MeshIPC:
 	socket = None
 	_sel = None
 	callback = None
+	now_server_event = None
 
 	def __init__(self, sel):
 		self._sel = sel
@@ -48,11 +49,12 @@ class MeshIPC:
 			self.socket.close()
 			self.socket = None
 
+		self.i_am_server = False
+
 	def connect(self):
 		if self.socket:
 			self._sel.unregister(self.socket)
 		created_server = self.server()
-		self.i_am_server = created_server
 
 		if not created_server:
 			self.client()
@@ -67,11 +69,14 @@ class MeshIPC:
 		except socket.error as e:
 			return False
 
+		self.i_am_server = True
 		self.socket = server
 		thread = threading.Thread(None, self.accept, None, (server,))
 		thread.setDaemon(True)
 		thread.start()
-		print("Im a server")
+
+		if self.now_server_event is not None:
+			self.now_server_event()
 
 		return True
 
@@ -304,6 +309,7 @@ class Viewer:
 				else:
 					self.meshIPC = MeshIPC(self.sel)
 					self.meshIPC.callback = self.event_handler
+					self.meshIPC.now_server_event = lambda: self.draw_buffer()
 				self.draw_buffer()
 
 			if c == "\x1b[B":  # Up arrow
