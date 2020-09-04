@@ -10,6 +10,9 @@ import socket
 import threading
 import errno
 
+if len(sys.argv) != 3:
+	print("Format: view.py path_to_folder file_name_pattern")
+	quit()
 
 def atoi(text):
     return int(text) if text.isdigit() else text
